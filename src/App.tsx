@@ -43,6 +43,25 @@ export default function App() {
   // Crawler config
   const [mode, setMode] = useState<ProcessingMode>('local');
   const [concurrency, setConcurrency] = useState<number>(3); // "Threads" counts
+  const [aiBatchSize, setAiBatchSize] = useState<number>(15);
+  const [aiBatchInterval, setAiBatchInterval] = useState<number>(1.5);
+  const [lowEffects, setLowEffects] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('low_effects_mode') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleLowEffects = () => {
+    const nextVal = !lowEffects;
+    setLowEffects(nextVal);
+    try {
+      localStorage.setItem('low_effects_mode', String(nextVal));
+    } catch (err) {
+      console.warn('LocalStorage error:', err);
+    }
+  };
 
   // Crawler processing state
   const [jobs, setJobs] = useState<SchoolJob[]>([]);
@@ -68,6 +87,8 @@ export default function App() {
   const jobsRef = useRef<SchoolJob[]>([]);
   const concurrencyRef = useRef<number>(concurrency);
   const modeRef = useRef<ProcessingMode>(mode);
+  const aiBatchSizeRef = useRef<number>(aiBatchSize);
+  const aiBatchIntervalRef = useRef<number>(aiBatchInterval);
 
   // Keep references in sync with state to avoid stale closure under async workers
   useEffect(() => {
@@ -85,6 +106,14 @@ export default function App() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    aiBatchSizeRef.current = aiBatchSize;
+  }, [aiBatchSize]);
+
+  useEffect(() => {
+    aiBatchIntervalRef.current = aiBatchInterval;
+  }, [aiBatchInterval]);
 
   // Synchronous timer trigger
   useEffect(() => {
@@ -255,6 +284,118 @@ export default function App() {
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+  // Run batch AI summarization in chunks of colleges to keep prompt size ideal and eliminate any rate-limits
+  const runBatchAiSummarization = async (scrapedJobs: SchoolJob[]) => {
+    // 1. Mark all scraped jobs as 'analyzing' to give visual progress cues
+    const updatedJobs = [...jobsRef.current];
+    scrapedJobs.forEach(job => {
+      const target = updatedJobs.find(j => j.id === job.id);
+      if (target) {
+        target.status = 'analyzing';
+        target.error = '排队等待 AI 批量提炼中...';
+      }
+    });
+    setJobs(updatedJobs);
+
+    const batchSize = aiBatchSizeRef.current;
+    const cooldownMs = aiBatchIntervalRef.current * 1000;
+    
+    for (let i = 0; i < scrapedJobs.length; i += batchSize) {
+      if (!isRunningRef.current) break;
+
+      const batch = scrapedJobs.slice(i, i + batchSize);
+      
+      // Update the current batch status
+      const updatedWithProgress = [...jobsRef.current];
+      batch.forEach(job => {
+        const target = updatedWithProgress.find(j => j.id === job.id);
+        if (target) {
+          target.error = `AI 提炼中 (${Math.floor(i / batchSize) + 1}/${Math.ceil(scrapedJobs.length / batchSize)} 组)...`;
+        }
+      });
+      setJobs(updatedWithProgress);
+
+      try {
+        const response = await fetch('/api/ai-summarize-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            schools: batch.map(b => ({
+              id: b.id,
+              name: b.name,
+              comments: b.comments
+            }))
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const latestJobs = [...jobsRef.current];
+
+        if (data.isQuotaExceeded) {
+          console.warn('Gemini API quota exceeded, gracefully degrading to local fallback...', data.errorMsg);
+          batch.forEach(b => {
+            const target = latestJobs.find(j => j.id === b.id);
+            if (target) {
+              const fallText = (b.comments || []).slice(0, 2).join('; ');
+              target.remark = fallText.substring(0, 18) + (fallText.length > 18 ? '...' : '');
+              target.status = 'completed';
+              target.error = 'API额度超载：已为您降级启用底层保障直录';
+            }
+          });
+          setJobs(latestJobs);
+          continue;
+        }
+
+        const results: Record<string, string> = data.results || {};
+
+        batch.forEach(b => {
+          const target = latestJobs.find(j => j.id === b.id);
+          if (target) {
+            const keyName = b.name;
+            const summary = results[keyName];
+            if (summary) {
+              target.remark = summary;
+              target.status = 'completed';
+              target.error = null;
+            } else {
+              // Fallback if key missing in JSON
+              const fallText = (b.comments || []).slice(0, 2).join('; ');
+              target.remark = fallText.substring(0, 18) + (fallText.length > 18 ? '...' : '');
+              target.status = 'completed';
+              target.error = 'AI总结匹配名偏差，降级启用安全直录备注';
+            }
+          }
+        });
+        setJobs(latestJobs);
+
+      } catch (error: any) {
+        console.error('Batch summary chunk failed, fell back:', error);
+        const latestJobs = [...jobsRef.current];
+        batch.forEach(b => {
+          const target = latestJobs.find(j => j.id === b.id);
+          if (target) {
+            const fallText = (b.comments || []).slice(0, 2).join('; ');
+            target.remark = fallText.substring(0, 18) + (fallText.length > 18 ? '...' : '');
+            target.status = 'completed';
+            target.error = 'AI总结临时不可服务，已执行本地降级记录';
+          }
+        });
+        setJobs(latestJobs);
+      }
+
+      // User-defined cooldown interval to comply with rate limits (and avoid spike traffic)
+      if (i + batchSize < scrapedJobs.length && isRunningRef.current && cooldownMs > 0) {
+        await sleep(cooldownMs);
+      }
+    }
+
+    setIsRunning(false);
+  };
+
   // Core Scheduler - Runs next available wait jobs
   const runNext = async () => {
     if (!isRunningRef.current) return;
@@ -264,10 +405,17 @@ export default function App() {
     const nextJobIdx = currentJobs.findIndex(j => j.status === 'waiting');
 
     if (nextJobIdx === -1) {
-      // No more jobs waiting. Let's check if all are completed/failed to wrap up
-      const activeJobs = currentJobs.filter(j => ['scraping', 'analyzing'].includes(j.status));
-      if (activeJobs.length === 0) {
-        setIsRunning(false);
+      // No more jobs waiting for crawling. Check if any threads are still active in scraping stage
+      const activeScraping = currentJobs.filter(j => j.status === 'scraping');
+      if (activeScraping.length === 0) {
+        // All web scraping is complete!
+        const scrapedJobs = currentJobs.filter(j => j.status === 'scraped');
+        if (scrapedJobs.length > 0 && modeRef.current === 'ai') {
+          // Trigger Batch AI summarizes for all scraped schools in ONE call (or chunks)
+          await runBatchAiSummarization(scrapedJobs);
+        } else {
+          setIsRunning(false);
+        }
       }
       return;
     }
@@ -306,109 +454,15 @@ export default function App() {
 
       // 2. Process findings under selected mode (Local vs AI)
       if (modeRef.current === 'ai') {
-        // AI summarizes negative reviews
-        jobToUpdate.status = 'analyzing';
+        // In AI Mode, phase 1 simply finishes and marks job as 'scraped'.
+        // Phase 2 will execute Gemini summarization in batches once crawler settles down.
+        jobToUpdate.status = 'scraped';
+        jobToUpdate.remark = '';
         jobToUpdate.error = null;
-        setJobs([...updatedJobs]);
-
-        let success = false;
-        let summaryText = '';
-        let retriesCount = 0;
-        const maxRetries = 3;
-
-        while (retriesCount <= maxRetries && isRunningRef.current) {
-          try {
-            const aiRes = await fetch('/api/ai-summarize', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                schoolName: targetJob.name,
-                comments: scrapeData.comments
-              })
-            });
-
-            if (aiRes.ok) {
-              const aiData = await aiRes.json();
-              summaryText = aiData.summary || '无负面舆情总结';
-              success = true;
-              break;
-            } else {
-              const errData = await aiRes.json().catch(() => ({}));
-              const errorText = errData.error || `HTTP ${aiRes.status}`;
-
-              if (
-                aiRes.status === 429 ||
-                errorText.includes('429') ||
-                errorText.toLowerCase().includes('quota') ||
-                errorText.toLowerCase().includes('rate_limits') ||
-                errorText.toLowerCase().includes('resource_exhausted')
-              ) {
-                retriesCount++;
-                if (retriesCount <= maxRetries) {
-                  const waitSec = 16 + (retriesCount * 2); // Wait 18s, then 20s, then 22s to clear the quota minute
-                  console.warn(`Hit rate limit on ${targetJob.name}. Waiting ${waitSec}s (retry ${retriesCount}/${maxRetries})...`);
-                  
-                  // Notify user about rate limit waiting and make status orange with dynamic text
-                  const latestJobs = [...jobsRef.current];
-                  const jobToSum = latestJobs.find(j => j.id === targetJob.id);
-                  if (jobToSum) {
-                    jobToSum.error = `429 频偏限流`;
-                    setJobs(latestJobs);
-                  }
-
-                  // Countdown loop so UI remains active
-                  for (let secLeft = waitSec; secLeft > 0; secLeft--) {
-                    if (!isRunningRef.current) break;
-                    const cJobs = [...jobsRef.current];
-                    const jT = cJobs.find(j => j.id === targetJob.id);
-                    if (jT) {
-                      jT.error = `频控避让：${secLeft}秒后进行第 ${retriesCount}/${maxRetries} 次重试...`;
-                      setJobs(cJobs);
-                    }
-                    await sleep(1000);
-                  }
-                  continue;
-                }
-              }
-              break;
-            }
-          } catch (fetchErr: any) {
-            console.error('Fetch summarize error:', fetchErr);
-            break;
-          }
-        }
-
-        const latestJobs = [...jobsRef.current];
-        const jobToSum = latestJobs.find(j => j.id === targetJob.id);
-        if (!jobToSum) return;
-
-        if (success) {
-          jobToSum.remark = summaryText;
-          jobToSum.status = 'completed';
-          jobToSum.error = null;
-        } else {
-          // Fallback to local concatenated tags/comments if AI summarization fails after retries
-          const fallText = scrapeData.comments.slice(0, 2).join('; ');
-          jobToSum.remark = fallText.substring(0, 18) + (fallText.length > 18 ? '...' : '');
-          jobToSum.status = 'completed';
-          jobToSum.error = 'AI总结临时超频限额，已降级启用底层安全直录预览';
-        }
-        setJobs(latestJobs);
-
-        // Crucial: Add a default 10-second pacing sleep between successful AI requests under Free Tier
-        // to proactively prevent triggering 429 limits in the first place!
-        if (success && isRunningRef.current) {
-          const paceSec = 11;
-          for (let pCell = paceSec; pCell > 0; pCell--) {
-            if (!isRunningRef.current) break;
-            await sleep(1000);
-          }
-        }
-
+        setJobs(updatedJobs);
       } else {
         // Local Mode - Extract top 3 direct comments stitched up
         const rawJoined = scrapeData.comments.slice(0, 3).join('；');
-        // Bound length or format neatly
         jobToUpdate.remark = rawJoined.length > 50 
           ? rawJoined.substring(0, 48) + '...' 
           : rawJoined;
@@ -464,7 +518,7 @@ export default function App() {
   };
 
   // Quick stats computed on-the-fly
-  const processedCount = jobs.filter(j => ['completed', 'not_found', 'failed'].includes(j.status)).length;
+  const processedCount = jobs.filter(j => ['completed', 'not_found', 'failed', 'scraped', 'analyzing'].includes(j.status)).length;
   const completedSuccess = jobs.filter(j => j.status === 'completed').length;
   const completedNotFound = jobs.filter(j => j.status === 'not_found').length;
   const failedCount = jobs.filter(j => j.status === 'failed').length;
@@ -558,11 +612,17 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans relative overflow-x-hidden pt-0 pb-0">
       
       {/* Background Mesh Gradients */}
-      <div className="absolute top-[-100px] right-[-100px] w-96 h-96 bg-blue-600/20 rounded-full blur-[120px] pointer-events-none z-0" />
-      <div className="absolute bottom-[-50px] left-[-50px] w-80 h-80 bg-purple-600/20 rounded-full blur-[100px] pointer-events-none z-0" />
+      {!lowEffects && (
+        <>
+          <div className="absolute top-[-100px] right-[-100px] w-96 h-96 bg-blue-600/20 rounded-full blur-[120px] pointer-events-none z-0" />
+          <div className="absolute bottom-[-50px] left-[-50px] w-80 h-80 bg-purple-600/20 rounded-full blur-[100px] pointer-events-none z-0" />
+        </>
+      )}
 
       {/* Header Bar */}
-      <header className="border-b border-white/10 bg-slate-900/40 backdrop-blur-2xl sticky top-0 z-50 px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+      <header className={`border-b border-white/10 sticky top-0 z-50 px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4 ${
+        lowEffects ? 'bg-slate-900 shadow-md' : 'bg-slate-900/40 backdrop-blur-2xl'
+      }`}>
         <div className="flex items-center gap-3">
           <div className="h-10 w-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
             <Layers className="h-5 w-5" />
@@ -580,6 +640,20 @@ export default function App() {
 
         {/* Header Links & status */}
         <div className="flex items-center gap-3">
+          {/* Low Effects Toggle Button */}
+          <button
+            onClick={toggleLowEffects}
+            className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-colors ${
+              lowEffects
+                ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                : 'bg-white/5 text-slate-400 border-white/10 hover:text-blue-400 hover:border-white/20 hover:bg-white/10'
+            }`}
+            title={lowEffects ? "极简模式已开启：已关闭网页发光背景及高开销动画" : "开启极简模式：减弱/关闭页面大型模糊背景与动效以显著降低CPU与GPU负载"}
+          >
+            <Cpu className="h-3.5 w-3.5" />
+            <span>{lowEffects ? "已开启低负载/省电模式" : "省电低效能模式"}</span>
+          </button>
+
           <a
             href="https://srgaoxiao.com"
             target="_blank"
@@ -599,11 +673,14 @@ export default function App() {
         <AnimatePresence mode="popLayout">
           {!fileData ? (
             <motion.div
-              layoutId="upload-card"
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -15 }}
-              className="bg-slate-900/40 backdrop-blur-2xl border border-white/10 p-8 shadow-2xl flex flex-col items-center justify-center text-center cursor-pointer transition-all hover:border-blue-500/50 group relative overflow-hidden z-10"
+              layoutId={lowEffects ? undefined : "upload-card"}
+              initial={lowEffects ? {} : { opacity: 0, y: 15 }}
+              animate={lowEffects ? {} : { opacity: 1, y: 0 }}
+              exit={lowEffects ? {} : { opacity: 0, y: -15 }}
+              transition={lowEffects ? { duration: 0 } : undefined}
+              className={`${
+                lowEffects ? 'bg-slate-900' : 'bg-slate-900/40 backdrop-blur-2xl'
+              } border border-white/10 p-8 shadow-2xl flex flex-col items-center justify-center text-center cursor-pointer transition-all hover:border-blue-500/50 group relative overflow-hidden z-10`}
               onDragOver={onDragOver}
               onDragLeave={onDragLeave}
               onDrop={onDrop}
@@ -649,10 +726,13 @@ export default function App() {
             </motion.div>
           ) : (
             <motion.div
-              layoutId="upload-card"
-              initial={{ opacity: 0, scale: 0.98 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="bg-slate-900/40 backdrop-blur-2xl border border-white/10 p-6 shadow-2xl flex flex-col gap-6 text-slate-200 z-10"
+              layoutId={lowEffects ? undefined : "upload-card"}
+              initial={lowEffects ? {} : { opacity: 0, scale: 0.98 }}
+              animate={lowEffects ? {} : { opacity: 1, scale: 1 }}
+              transition={lowEffects ? { duration: 0 } : undefined}
+              className={`${
+                lowEffects ? 'bg-slate-900/90' : 'bg-slate-900/40 backdrop-blur-2xl'
+              } border border-white/10 p-6 shadow-2xl flex flex-col gap-6 text-slate-200 z-10`}
             >
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-white/5 pb-5">
                 <div className="flex items-center gap-4">
@@ -770,6 +850,74 @@ export default function App() {
 
               </div>
 
+              {/* AI Batch advanced speed/error-cooldown controllers */}
+              {mode === 'ai' && (
+                <div className="pt-5 border-t border-white/5 flex flex-col gap-4">
+                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                    <Sparkles className={`h-3.5 w-3.5 text-blue-400 ${lowEffects ? '' : 'animate-pulse'}`} />
+                    AI 批量总结组包与间隔控制 (防 API 频限)
+                  </h4>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {/* Batch Size Slider */}
+                    <div className="flex flex-col gap-2">
+                      <label className="text-xs font-semibold text-slate-300 flex items-center justify-between gap-1.5">
+                        <span className="flex items-center gap-1.5">
+                          <Layers className="h-4 w-4 text-slate-400" />
+                          每组合并分析高校数 (Batch Size)
+                        </span>
+                        <span className="text-xs text-blue-400 font-mono font-semibold bg-blue-500/10 border border-blue-500/20 px-2.5 py-0.5 rounded-md">
+                          {aiBatchSize} 所高校/组
+                        </span>
+                      </label>
+                      <p className="text-[11px] text-slate-400">单次批量请求中打包的高校数。数额越大越能极大地节省大模型调用额度消耗与轮询等待，数额越小越能保障各高校槽点提炼准确度。</p>
+
+                      <div className="flex items-center gap-3 pt-2">
+                        <input
+                          type="range"
+                          min="2"
+                          max="40"
+                          step="1"
+                          value={aiBatchSize}
+                          onChange={(e) => setAiBatchSize(Number(e.target.value))}
+                          disabled={isRunning}
+                          className="flex-1 accent-blue-500 cursor-pointer disabled:opacity-40"
+                        />
+                        <span className="text-xs text-slate-400 font-mono w-6 text-right">{aiBatchSize}</span>
+                      </div>
+                    </div>
+
+                    {/* Delay Interval (Cooldown) Slider */}
+                    <div className="flex flex-col gap-2">
+                      <label className="text-xs font-semibold text-slate-300 flex items-center justify-between gap-1.5">
+                        <span className="flex items-center gap-1.5">
+                          <Hourglass className="h-4 w-4 text-slate-400" />
+                          组请求安全等待延迟 (Wait Interval)
+                        </span>
+                        <span className="text-xs text-blue-400 font-mono font-semibold bg-blue-500/10 border border-blue-500/20 px-2.5 py-0.5 rounded-md">
+                          {aiBatchInterval} 秒
+                        </span>
+                      </label>
+                      <p className="text-[11px] text-slate-400">发送完上一组批量 AI 总结请求后强制进入的安全等待间隔（防429频限）。推荐至少设置 1.5 - 3.0 秒秒数延迟。</p>
+
+                      <div className="flex items-center gap-3 pt-2">
+                        <input
+                          type="range"
+                          min="0"
+                          max="15"
+                          step="0.5"
+                          value={aiBatchInterval}
+                          onChange={(e) => setAiBatchInterval(Number(e.target.value))}
+                          disabled={isRunning}
+                          className="flex-1 accent-blue-500 cursor-pointer disabled:opacity-40"
+                        />
+                        <span className="text-xs text-slate-400 font-mono w-6 text-right">{aiBatchInterval}s</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Advanced warning description */}
               {mode === 'ai' && (
                 <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-start gap-2.5">
@@ -792,7 +940,9 @@ export default function App() {
             <div className="lg:col-span-1 flex flex-col gap-6">
               
               {/* Controllers Widget */}
-              <div className="bg-slate-900/40 backdrop-blur-md border border-white/10 rounded-2xl p-5 shadow-2xl flex flex-col gap-4 text-slate-200">
+              <div className={`${
+                lowEffects ? 'bg-slate-900 shadow-md' : 'bg-slate-900/40 backdrop-blur-md shadow-2xl'
+              } border border-white/10 rounded-2xl p-5 flex flex-col gap-4 text-slate-200`}>
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">控制面板</h4>
                 
                 <div className="flex flex-col gap-2.5">
@@ -800,7 +950,9 @@ export default function App() {
                     <button
                       onClick={startProcessing}
                       disabled={jobs.length === 0}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 text-white font-semibold rounded-xl text-sm transition-all shadow-lg shadow-blue-500/20 hover:bg-blue-500 disabled:opacity-40 disabled:shadow-none"
+                      className={`w-full flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 text-white font-semibold rounded-xl text-sm transition-all ${
+                        lowEffects ? '' : 'shadow-lg shadow-blue-500/20'
+                      } hover:bg-blue-500 disabled:opacity-40 disabled:shadow-none`}
                     >
                       <Play className="h-4 w-4 fill-white text-white" />
                       开始舆情检索
@@ -808,7 +960,9 @@ export default function App() {
                   ) : (
                     <button
                       onClick={pauseProcessing}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-amber-500 text-white font-semibold rounded-xl text-sm transition-all shadow-lg shadow-amber-500/20 hover:bg-amber-600"
+                      className={`w-full flex items-center justify-center gap-2 px-4 py-3 bg-amber-500 text-white font-semibold rounded-xl text-sm transition-all ${
+                        lowEffects ? '' : 'shadow-lg shadow-amber-500/20'
+                      } hover:bg-amber-600`}
                     >
                       <Pause className="h-4 w-4 fill-white text-white" />
                       暂停当前作业
@@ -833,7 +987,11 @@ export default function App() {
                   </div>
                   <div className="w-full h-2 rounded-full bg-slate-950 overflow-hidden">
                     <div
-                      className={`h-full transition-all duration-300 ${isRunning ? 'bg-gradient-to-r from-blue-500 to-indigo-500' : 'bg-slate-600'}`}
+                      className={`h-full transition-all duration-300 ${
+                        isRunning 
+                          ? (lowEffects ? 'bg-blue-500' : 'bg-gradient-to-r from-blue-500 to-indigo-500') 
+                          : 'bg-slate-600'
+                      }`}
                       style={{ width: `${percentComplete}%` }}
                     />
                   </div>
@@ -841,7 +999,7 @@ export default function App() {
                     <span>已完成 {processedCount} / {totalCount}</span>
                     {isRunning && estRemaining !== null && (
                       <span className="flex items-center gap-1">
-                        <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
+                        <Loader2 className={`h-3 w-3 text-blue-400 ${lowEffects ? '' : 'animate-spin'}`} />
                         预计余下 {estRemaining} 秒
                       </span>
                     )}
@@ -850,7 +1008,9 @@ export default function App() {
               </div>
 
               {/* Quick statistics widgets */}
-              <div className="bg-slate-900/40 backdrop-blur border border-white/10 rounded-2xl p-5 shadow-2xl flex flex-col gap-4 text-slate-200">
+              <div className={`${
+                lowEffects ? 'bg-slate-900 shadow-md' : 'bg-slate-900/40 backdrop-blur border shadow-2xl'
+              } border border-white/10 rounded-2xl p-5 flex flex-col gap-4 text-slate-200`}>
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">采集数据统计</h4>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -886,7 +1046,9 @@ export default function App() {
               </div>
 
               {/* Data exporter output widget */}
-              <div className="bg-slate-900/40 backdrop-blur-md border border-white/10 rounded-2xl p-5 shadow-2xl flex flex-col gap-3 text-slate-200">
+              <div className={`${
+                lowEffects ? 'bg-slate-900 shadow-md' : 'bg-slate-900/40 backdrop-blur-md shadow-2xl'
+              } border border-white/10 rounded-2xl p-5 flex flex-col gap-3 text-slate-200`}>
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">结果回写导出</h4>
                 <p className="text-[11px] text-slate-400">
                   基于上传的导入表格，在最后一列追加新建“备注”列，写入已检索的高校负面舆情或AI摘要结果。
@@ -894,7 +1056,9 @@ export default function App() {
                 <button
                   onClick={handleExport}
                   disabled={processedCount === 0}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-500 text-white font-bold rounded-xl text-xs shadow-lg shadow-green-500/20 transition-all disabled:opacity-40 disabled:shadow-none"
+                  className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-500 text-white font-bold rounded-xl text-xs transition-all disabled:opacity-40 disabled:shadow-none ${
+                    lowEffects ? '' : 'shadow-lg shadow-green-500/20'
+                  }`}
                 >
                   <Download className="h-4 w-4" />
                   导出已更新的表格报告 (.xlsx)
@@ -906,7 +1070,9 @@ export default function App() {
             {/* Right Box: University Job List table container */}
             <div className="lg:col-span-3 flex flex-col gap-4">
               
-              <div className="bg-slate-900/40 backdrop-blur-md border border-white/10 rounded-3xl overflow-hidden flex-1 flex flex-col shadow-2xl text-slate-200">
+              <div className={`${
+                lowEffects ? 'bg-slate-900 shadow-md' : 'bg-slate-900/40 backdrop-blur-md shadow-2xl'
+              } border border-white/10 rounded-3xl overflow-hidden flex-1 flex flex-col text-slate-200`}>
                 <div className="px-6 py-4 border-b border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                   <div className="flex items-center gap-2">
                     <Search className="h-4 w-4 text-slate-400" />
@@ -919,7 +1085,7 @@ export default function App() {
 
                 {jobs.length === 0 ? (
                   <div className="flex-1 flex flex-col items-center justify-center p-12 text-center text-slate-500">
-                    <Hourglass className="h-12 w-12 text-slate-600 mb-2 animate-pulse" />
+                    <Hourglass className={`h-12 w-12 text-slate-600 mb-2 ${lowEffects ? '' : 'animate-pulse'}`} />
                     <p className="text-sm">暂无待检索的高校数据行</p>
                   </div>
                 ) : (
@@ -959,15 +1125,21 @@ export default function App() {
                                     </span>
                                   )}
                                   {job.status === 'scraping' && (
-                                    <span className="px-2 py-1 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center gap-1 w-max animate-pulse font-medium">
-                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    <span className={`px-2 py-1 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center gap-1 w-max font-medium ${lowEffects ? '' : 'animate-pulse'}`}>
+                                      <Loader2 className={`h-3 w-3 ${lowEffects ? '' : 'animate-spin'}`} />
                                       正在抓取舆情
                                     </span>
                                   )}
                                   {job.status === 'analyzing' && (
-                                    <span className={`px-2 py-1 rounded border flex items-center gap-1 w-max font-medium animate-pulse ${job.error ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-purple-500/10 text-purple-400 border-purple-500/20'}`}>
-                                      <Sparkles className={`h-3 w-3 animate-spin ${job.error ? 'text-amber-400' : 'text-purple-400'}`} />
-                                      {job.error ? '避让重试中...' : 'AI 提炼槽点...'}
+                                    <span className={`px-2 py-1 rounded border flex items-center gap-1 w-max font-medium ${lowEffects ? '' : 'animate-pulse'} ${job.error ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-purple-500/10 text-purple-400 border-purple-500/20'}`}>
+                                      <Sparkles className={`h-3 w-3 ${lowEffects ? '' : 'animate-spin'} ${job.error ? 'text-amber-400' : 'text-purple-400'}`} />
+                                      {job.error ? 'AI 总结中...' : 'AI 提炼槽点...'}
+                                    </span>
+                                  )}
+                                  {job.status === 'scraped' && (
+                                    <span className="px-2 py-1 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 flex items-center gap-1 w-max font-medium">
+                                      <CheckCircle2 className="h-3 w-3 text-indigo-400" />
+                                      已抓取(待 AI)
                                     </span>
                                   )}
                                   {job.status === 'completed' && (
@@ -1019,8 +1191,10 @@ export default function App() {
                                     <span className="text-slate-300 line-clamp-1 max-w-sm" title={job.remark}>
                                       {job.remark}
                                     </span>
+                                  ) : job.status === 'scraped' ? (
+                                    <span className="text-indigo-400 font-medium font-sans">已抓取 {job.comments.length} 条评论，待一并总结</span>
                                   ) : job.status === 'analyzing' && job.error ? (
-                                    <span className="text-amber-400 font-medium font-sans animate-pulse">{job.error}</span>
+                                    <span className={`text-amber-400 font-medium font-sans ${lowEffects ? '' : 'animate-pulse'}`}>{job.error}</span>
                                   ) : job.status === 'failed' && job.error ? (
                                     <span className="text-rose-400 line-clamp-1">{job.error}</span>
                                   ) : (
@@ -1047,11 +1221,12 @@ export default function App() {
                               <AnimatePresence initial={false}>
                                 {isExpanded && (
                                   <tr>
-                                    <td colSpan={6} className="bg-slate-950/40 p-0 border-b border-white/5">
+                                    <td colSpan={6} className={`${lowEffects ? 'bg-slate-900 shadow-inner' : 'bg-slate-950/40'} p-0 border-b border-white/5`}>
                                       <motion.div
-                                        initial={{ opacity: 0, height: 0 }}
-                                        animate={{ opacity: 1, height: 'auto' }}
-                                        exit={{ opacity: 0, height: 0 }}
+                                        initial={lowEffects ? {} : { opacity: 0, height: 0 }}
+                                        animate={lowEffects ? {} : { opacity: 1, height: 'auto' }}
+                                        exit={lowEffects ? {} : { opacity: 0, height: 0 }}
+                                        transition={lowEffects ? { duration: 0 } : undefined}
                                         className="overflow-hidden"
                                       >
                                         <div className="px-8 py-5 flex flex-col gap-4">

@@ -274,7 +274,7 @@ app.get("/api/scrape-school", async (req, res) => {
   }
 });
 
-// Gemini Summarize Route
+// Gemini Summarize Route (Legacy/Single fallback)
 app.post("/api/ai-summarize", async (req, res) => {
   const { schoolName, comments } = req.body;
 
@@ -289,34 +289,112 @@ app.post("/api/ai-summarize", async (req, res) => {
   try {
     const ai = getAiClient();
     const prompt = `你是一个高校舆情和吐槽曝光评论的分析专家。
-下面是关于【${schoolName}】这所大学在神人高校网被网友吐槽和评论的内容：
+下面是关于【${schoolName}】这所大学被网友吐槽和评论的内容：
 ---
 ${comments.map((c, idx) => `[评论 ${idx + 1}]: ${c}`).join("\n\n")}
 ---
 
 请合并和分析这些吐槽，写出一个极其简明扼要的槽点总结。
 约束条件：
-1. 字数在20字以内。
-2. 切中要害（如：宿舍无空调、食堂偏贵、强制晨跑、管理僵硬等）。
-3. 语气客观简练，不要有任何前缀或解释，直接给出这句总结。
-4. 如果评论全无实质性爆料或都在灌水，则简述为“有舆情记录但爆料内容空泛”。
-`;
+1. 字数在 20 字以内。
+2. 语气客观中立，避开主观评价（字数决不能超出 20 个字）。
+3. 如果评论都是水贴或无意义内容，直接概括写“未见实质吐槽”。`;
 
     const response = await ai.models.generateContent({
       model: "gemini-3.5-flash",
       contents: prompt,
     });
 
-    const summary = response.text ? response.text.trim() : "无核心槽点";
-    
-    // Remove wrapping quotes if any
-    const cleanSummary = summary.replace(/^["'“]+|["'”]+$/g, "");
+    const summary = response.text ? response.text.trim() : "无负面舆情总结";
+    return res.json({ summary });
+  } catch (error: any) {
+    console.error(`AI Summarization failed for ${schoolName}:`, error);
+    const errString = String(error.message || error);
+    if (
+      errString.includes("429") ||
+      errString.toLowerCase().includes("quota") ||
+      errString.toLowerCase().includes("limit") ||
+      errString.toLowerCase().includes("resource_exhausted")
+    ) {
+      return res.json({
+        summary: "免费API额度已满，启动降级备注",
+        isQuotaExceeded: true
+      });
+    }
+    return res.status(500).json({ error: `AI 总结失败: ${error.message || error}` });
+  }
+});
 
-    return res.json({ summary: cleanSummary });
+// Gemini Batch Summarize Route
+app.post("/api/ai-summarize-batch", async (req, res) => {
+  const { schools } = req.body;
+
+  if (!schools || !Array.isArray(schools) || schools.length === 0) {
+    return res.status(400).json({ error: "学校列表不能为空" });
+  }
+
+  try {
+    const ai = getAiClient();
+    
+    // Structure input data for Gemini to see
+    const promptInput = schools.map(s => ({
+      schoolName: s.name,
+      comments: (s.comments || []).slice(0, 15)
+    }));
+
+    const prompt = `你是一个中国高校舆情和网友曝光评论的深度总结专家。
+现在，有 ${schools.length} 所高校的吐槽和爆料评论列表。请你分别为这几所高校，合并、分析所有的负面评论/槽点，写出一个 20 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。
+
+输出规范：
+1. 请必须返回一个合法的 JSON 对象，它的键(Key)是列表里的高校名称 (schoolName)，值(Value)是提炼的 20 字以内吐槽归纳。例如：
+{
+  "中国石油大学（北京）": "校区偏远大一强制晨跑自习，管理拟高中化",
+  "北京大学": "食堂拥挤，部分楼宿年代比较久远"
+}
+2. 约束字数在 20 个汉字以内，直切要害（如：宿舍条件差、强制早操、教务死板、周边偏僻等）。
+3. 语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”、“该校槽点为”等），不废话，直接给出高信息浓度的总结。
+4. 如果评论为空或全部是无意义或正面水贴，直接写“评论数据空泛或未见实质性被曝槽点”。
+
+以下是需要分析的高校评论数据列表：
+${JSON.stringify(promptInput, null, 2)}
+`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+      }
+    });
+
+    const responseText = response.text ? response.text.trim() : "{}";
+    let results: Record<string, string> = {};
+    try {
+      results = JSON.parse(responseText);
+    } catch (parseError) {
+      console.warn("Gemini didn't return perfect JSON or it failed to parse. Attempting code-block strip...");
+      const cleanJsonStr = responseText.replace(/```json|```/g, "").trim();
+      results = JSON.parse(cleanJsonStr);
+    }
+
+    return res.json({ results });
 
   } catch (error: any) {
-    console.error(`AI summarization failed for ${schoolName}:`, error);
-    return res.status(500).json({ error: `AI 总结失败: ${error.message || error}` });
+    console.error("AI batch summarization failed:", error);
+    const errString = String(error.message || error);
+    if (
+      errString.includes("429") ||
+      errString.toLowerCase().includes("quota") ||
+      errString.toLowerCase().includes("limit") ||
+      errString.toLowerCase().includes("resource_exhausted")
+    ) {
+      return res.json({
+        results: {},
+        isQuotaExceeded: true,
+        errorMsg: "免费版 Gemini API 每日调用频次已限额 (Rate Limit Exceeded)。我们已为您自动无缝降级启动「底线直录槽点」本地模式，表格数据依然可以极速分析并导出！"
+      });
+    }
+    return res.status(500).json({ error: `AI 批量总结失败: ${error.message || error}` });
   }
 });
 
