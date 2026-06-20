@@ -1,0 +1,6 @@
+{
+  "name": "神人高校评论检索器",
+  "description": "支持上传高校名单Excel/CSV，多线程自动检索神人高校网上对应的高校评论，支持AI模式一键总结并导出含有备注列的表格。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
