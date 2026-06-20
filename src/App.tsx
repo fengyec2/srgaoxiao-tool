@@ -253,6 +253,8 @@ export default function App() {
     }
   };
 
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
   // Core Scheduler - Runs next available wait jobs
   const runNext = async () => {
     if (!isRunningRef.current) return;
@@ -306,33 +308,102 @@ export default function App() {
       if (modeRef.current === 'ai') {
         // AI summarizes negative reviews
         jobToUpdate.status = 'analyzing';
+        jobToUpdate.error = null;
         setJobs([...updatedJobs]);
 
-        const aiRes = await fetch('/api/ai-summarize', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            schoolName: targetJob.name,
-            comments: scrapeData.comments
-          })
-        });
+        let success = false;
+        let summaryText = '';
+        let retriesCount = 0;
+        const maxRetries = 3;
+
+        while (retriesCount <= maxRetries && isRunningRef.current) {
+          try {
+            const aiRes = await fetch('/api/ai-summarize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                schoolName: targetJob.name,
+                comments: scrapeData.comments
+              })
+            });
+
+            if (aiRes.ok) {
+              const aiData = await aiRes.json();
+              summaryText = aiData.summary || '无负面舆情总结';
+              success = true;
+              break;
+            } else {
+              const errData = await aiRes.json().catch(() => ({}));
+              const errorText = errData.error || `HTTP ${aiRes.status}`;
+
+              if (
+                aiRes.status === 429 ||
+                errorText.includes('429') ||
+                errorText.toLowerCase().includes('quota') ||
+                errorText.toLowerCase().includes('rate_limits') ||
+                errorText.toLowerCase().includes('resource_exhausted')
+              ) {
+                retriesCount++;
+                if (retriesCount <= maxRetries) {
+                  const waitSec = 16 + (retriesCount * 2); // Wait 18s, then 20s, then 22s to clear the quota minute
+                  console.warn(`Hit rate limit on ${targetJob.name}. Waiting ${waitSec}s (retry ${retriesCount}/${maxRetries})...`);
+                  
+                  // Notify user about rate limit waiting and make status orange with dynamic text
+                  const latestJobs = [...jobsRef.current];
+                  const jobToSum = latestJobs.find(j => j.id === targetJob.id);
+                  if (jobToSum) {
+                    jobToSum.error = `429 频偏限流`;
+                    setJobs(latestJobs);
+                  }
+
+                  // Countdown loop so UI remains active
+                  for (let secLeft = waitSec; secLeft > 0; secLeft--) {
+                    if (!isRunningRef.current) break;
+                    const cJobs = [...jobsRef.current];
+                    const jT = cJobs.find(j => j.id === targetJob.id);
+                    if (jT) {
+                      jT.error = `频控避让：${secLeft}秒后进行第 ${retriesCount}/${maxRetries} 次重试...`;
+                      setJobs(cJobs);
+                    }
+                    await sleep(1000);
+                  }
+                  continue;
+                }
+              }
+              break;
+            }
+          } catch (fetchErr: any) {
+            console.error('Fetch summarize error:', fetchErr);
+            break;
+          }
+        }
 
         const latestJobs = [...jobsRef.current];
         const jobToSum = latestJobs.find(j => j.id === targetJob.id);
         if (!jobToSum) return;
 
-        if (aiRes.ok) {
-          const aiData = await aiRes.json();
-          jobToSum.remark = aiData.summary || '无负面舆情总结';
+        if (success) {
+          jobToSum.remark = summaryText;
           jobToSum.status = 'completed';
+          jobToSum.error = null;
         } else {
-          // Fallback to local concatenated keywords if AI summaries fail
+          // Fallback to local concatenated tags/comments if AI summarization fails after retries
           const fallText = scrapeData.comments.slice(0, 2).join('; ');
           jobToSum.remark = fallText.substring(0, 18) + (fallText.length > 18 ? '...' : '');
           jobToSum.status = 'completed';
-          jobToSum.error = 'AI 总结临时接口异常，已降级启用本地直录备注';
+          jobToSum.error = 'AI总结临时超频限额，已降级启用底层安全直录预览';
         }
         setJobs(latestJobs);
+
+        // Crucial: Add a default 10-second pacing sleep between successful AI requests under Free Tier
+        // to proactively prevent triggering 429 limits in the first place!
+        if (success && isRunningRef.current) {
+          const paceSec = 11;
+          for (let pCell = paceSec; pCell > 0; pCell--) {
+            if (!isRunningRef.current) break;
+            await sleep(1000);
+          }
+        }
 
       } else {
         // Local Mode - Extract top 3 direct comments stitched up
@@ -894,9 +965,9 @@ export default function App() {
                                     </span>
                                   )}
                                   {job.status === 'analyzing' && (
-                                    <span className="px-2 py-1 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1 w-max font-medium animate-pulse">
-                                      <Sparkles className="h-3 w-3 animate-spin text-purple-400" />
-                                      AI 提炼槽点...
+                                    <span className={`px-2 py-1 rounded border flex items-center gap-1 w-max font-medium animate-pulse ${job.error ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-purple-500/10 text-purple-400 border-purple-500/20'}`}>
+                                      <Sparkles className={`h-3 w-3 animate-spin ${job.error ? 'text-amber-400' : 'text-purple-400'}`} />
+                                      {job.error ? '避让重试中...' : 'AI 提炼槽点...'}
                                     </span>
                                   )}
                                   {job.status === 'completed' && (
@@ -948,6 +1019,8 @@ export default function App() {
                                     <span className="text-slate-300 line-clamp-1 max-w-sm" title={job.remark}>
                                       {job.remark}
                                     </span>
+                                  ) : job.status === 'analyzing' && job.error ? (
+                                    <span className="text-amber-400 font-medium font-sans animate-pulse">{job.error}</span>
                                   ) : job.status === 'failed' && job.error ? (
                                     <span className="text-rose-400 line-clamp-1">{job.error}</span>
                                   ) : (
