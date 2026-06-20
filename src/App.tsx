@@ -151,6 +151,7 @@ export default function App() {
         // Auto match rules (Find keywords like 学校, 高校, 大学, 校名 etc.)
         const matchKeywords = ['学校', '高校', '大学', '名称', '校名', 'school', 'university', 'college', 'name', 'academy'];
         let detectedIndex = headers.findIndex(h => {
+          if (!h || typeof h !== 'string') return false;
           const lower = h.toLowerCase();
           return matchKeywords.some(kw => lower.includes(kw));
         });
@@ -179,9 +180,11 @@ export default function App() {
     reader.readAsBinaryString(file);
   };
 
-  // Convert parsed sheet rows to jobs list
+  // Convert parsed sheet rows to jobs list with deduplication of school names
   const initializeJobs = (rows: any[][], colIdx: number) => {
     const initializedJobs: SchoolJob[] = [];
+    const seenNames = new Set<string>();
+
     // Index 0 represents the column headers, so we start from row 1
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
@@ -189,6 +192,13 @@ export default function App() {
       const cleanName = nameVal ? String(nameVal).trim() : '';
 
       if (cleanName) {
+        const lowerName = cleanName.toLowerCase();
+        if (seenNames.has(lowerName)) {
+          // Skip if this school name is already added to avoid redundant scraping
+          continue;
+        }
+        seenNames.add(lowerName);
+
         initializedJobs.push({
           id: `row-${i}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
           name: cleanName,
@@ -226,7 +236,7 @@ export default function App() {
     const files = e.dataTransfer.files;
     if (files.length > 0) {
       const file = files[0];
-      const ext = file.name.split('.').pop()?.toLowerCase();
+      const ext = file?.name ? file.name.split('.').pop()?.toLowerCase() : '';
       if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
         handleFile(file);
       } else {
@@ -418,9 +428,9 @@ export default function App() {
         remarkColIndex = headers.length - 1;
       }
 
-      const matchingResultsMap = new Map<number, string>();
+      const matchingResultsMap = new Map<string, string>();
       jobs.forEach(job => {
-        matchingResultsMap.set(job.rowIndex, job.remark || '');
+        matchingResultsMap.set(job.name.toLowerCase().trim(), job.remark || '');
       });
 
       const updatedMatrix: any[][] = [];
@@ -435,7 +445,9 @@ export default function App() {
           row.push('');
         }
 
-        const universityRemark = matchingResultsMap.get(i) || '';
+        const nameVal = row[selectedColIndex];
+        const cleanName = nameVal ? String(nameVal).trim() : '';
+        const universityRemark = matchingResultsMap.get(cleanName.toLowerCase().trim()) || '';
         
         if (remarkColIndex < originalRows[0].length) {
           // Overwrite existing remark column values if any
@@ -584,7 +596,7 @@ export default function App() {
                       </span>
                     </h3>
                     <p className="text-xs text-slate-400 mt-1">
-                      成功读取 {fileData.rows.length - 1} 行记录。
+                      成功读取 {fileData.rows.length - 1} 行记录（已自动去重保留 {jobs.length} 个唯一高校名称）。
                     </p>
                   </div>
                 </div>

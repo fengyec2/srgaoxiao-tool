@@ -38,16 +38,86 @@ const PORT = 3000;
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
+// Helper to clean university name annotations and yield fallback search phrases
+function getSearchKeywords(schoolName: string): string[] {
+  let base = schoolName.trim().split(/\r?\n/)[0].trim();
+  base = base.replace(/\s+/g, "");
+  
+  // Normalize full-width parentheticals to standard half-width
+  base = base.replace(/（/g, "(").replace(/）/g, ")");
+  base = base.replace(/【/g, "[").replace(/】/g, "]");
+
+  const keywords: string[] = [];
+
+  // 1. Clean noise terms like (本科), (公办), (民办) but keep campus names like (华东) or (深圳校区)
+  const noiseRegex = /\((本科|专科|公办|民办|独立学院|中外合资|中外合作|筹|建设中|高职|高专|成人|网络|双一流|211|985|省属|市属|部属|公立|私立|普通|职业|技术|公立普通高校)\)/gi;
+  const bracketNoise = /\[(本科|专科|公办|民办|独立学院|中外合资|中外合作|筹|建设中|高职|高专|成人|网络|双一流|211|985|省属|市属|部属|公立|私立|普通|职业|技术|公立普通高校)\]/gi;
+  
+  let kw1 = base.replace(noiseRegex, "").replace(bracketNoise, "").trim();
+  if (kw1) {
+    keywords.push(kw1);
+  }
+
+  // 2. Clear ALL bracket expressions completely (e.g. "中国石油大学(华东)" -> "中国石油大学")
+  let kw2 = base.replace(/\(.*?\)/g, "").replace(/\[.*?\]/g, "").trim();
+  if (kw2 && kw2 !== kw1) {
+    keywords.push(kw2);
+  }
+
+  // 3. Keep purely alphanumerics + chinese
+  let kw3 = kw2.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, "").trim();
+  if (kw3 && kw3 !== kw2 && kw3 !== kw1) {
+    keywords.push(kw3);
+  }
+
+  // 4. Match the first contiguous chunk ending with "大学" or "学院" or "学校"
+  const match = base.match(/^([\u4e00-\u9fa5]+(大学|学院|学校|分校))/);
+  if (match && match[1]) {
+    const kw4 = match[1];
+    if (!keywords.includes(kw4)) {
+      keywords.push(kw4);
+    }
+  }
+
+  if (keywords.length === 0) {
+    keywords.push(base);
+  }
+
+  // Deduplicate and filter extremely short terms
+  return Array.from(new Set(keywords)).filter(k => k.length >= 2);
+}
+
 // Helper to determine string similarity for matching school names
 function calculateMatches(s1: string, s2: string): number {
   if (!s1 || !s2) return 0;
+  
+  // Normalize characters and casing
+  const n1 = s1.toLowerCase()
+    .replace(/（/g, "(").replace(/）/g, ")")
+    .replace(/【/g, "[").replace(/】/g, "]")
+    .replace(/\s+/g, "");
+    
+  const n2 = s2.toLowerCase()
+    .replace(/（/g, "(").replace(/）/g, ")")
+    .replace(/【/g, "[").replace(/】/g, "]")
+    .replace(/\s+/g, "");
+
+  if (n1 === n2) return 1.0;
+
+  // Substring inclusion bonus
+  if (n1.includes(n2) || n2.includes(n1)) {
+    const shorter = Math.min(n1.length, n2.length);
+    const longer = Math.max(n1.length, n2.length);
+    return 0.85 + (shorter / longer) * 0.15;
+  }
+
   let matches = 0;
-  for (let i = 0; i < s1.length; i++) {
-    if (s2.includes(s1[i])) {
+  for (let i = 0; i < n1.length; i++) {
+    if (n2.includes(n1[i])) {
       matches++;
     }
   }
-  return matches / Math.max(s1.length, s2.length);
+  return matches / Math.max(n1.length, n2.length);
 }
 
 // Scrape Route
@@ -61,62 +131,60 @@ app.get("/api/scrape-school", async (req, res) => {
   console.log(`Starting crawl for school: ${cleanName}`);
 
   try {
-    // 1. Search school on srgaoxiao
-    const searchUrl = `https://srgaoxiao.com/schools?keyword=${encodeURIComponent(cleanName)}&page=1`;
-    const searchResponse = await fetch(searchUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      },
-    });
+    const searchKeywords = getSearchKeywords(cleanName);
+    console.log(`Generated clean search keywords for "${cleanName}":`, searchKeywords);
 
-    if (!searchResponse.ok) {
-      throw new Error(`无法访问神人高校网，状态码: ${searchResponse.status}`);
-    }
+    const candidates: { id: number; name: string; slug: string; score: number }[] = [];
+    const triedKeywords: string[] = [];
 
-    const searchHtml = await searchResponse.text();
-    const $search = cheerio.load(searchHtml);
+    // Loop through keywords to find matches via official search API
+    for (const keyword of searchKeywords) {
+      if (candidates.length > 0) break; // Matches found, avoid unnecessary loads
 
-    // Collect school anchors
-    const candidates: { name: string; href: string; score: number }[] = [];
-    $search("a").each((_, el) => {
-      const href = $search(el).attr("href") || "";
-      const text = $search(el).text().trim();
-      
-      // Look for school details href pattern: e.g. /schools/1 or /school/xxx
-      if ((href.includes("/schools/") || href.includes("/school/")) && text.length > 1) {
-        // Exclude generic /schools index pages or page navigation links
-        if (href === "/schools" || href.endsWith("/schools/")) return;
-        
-        const score = calculateMatches(cleanName, text);
-        candidates.push({
-          name: text,
-          href,
-          score,
-        });
+      triedKeywords.push(keyword);
+      console.log(`Querying srgaoxiao search API with query: "${keyword}"`);
+
+      const searchUrl = `https://srgaoxiao.com/api/schools?keyword=${encodeURIComponent(keyword)}`;
+      const searchResponse = await fetch(searchUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json",
+        },
+      });
+
+      if (!searchResponse.ok) {
+        console.warn(`Search API request failed for "${keyword}", status: ${searchResponse.status}`);
+        continue;
       }
-    });
 
-    // Also look for grid headings of school names in the HTML just in case
-    $search(".school-card, .school-item, .card, h2, h3").each((_, el) => {
-      const cardText = $search(el).text().trim();
-      const cardLink = $search(el).find("a").attr("href") || $search(el).closest("a").attr("href") || "";
-      if (cardLink && (cardLink.includes("/schools/") || cardLink.includes("/school/")) && cardText.length > 1) {
-        if (cardLink === "/schools" || cardLink.endsWith("/schools/")) return;
-        const shortText = cardText.split("\n")[0].trim();
-        const score = calculateMatches(cleanName, shortText);
-        // Avoid duplicates
-        if (!candidates.some(c => c.href === cardLink)) {
-          candidates.push({ name: shortText, href: cardLink, score });
+      const json: any = await searchResponse.json();
+      const schoolList = json.data || [];
+
+      for (const item of schoolList) {
+        if (!item.name || !item.id) continue;
+        
+        // Match similarity against the first cleaned keyword (removes noise annotations like (本科), (公办))
+        const cleanQuery = searchKeywords[0];
+        const score = Math.max(
+          calculateMatches(cleanQuery, item.name),
+          calculateMatches(cleanName, item.name)
+        );
+
+        if (!candidates.some(c => c.id === item.id)) {
+          candidates.push({
+            id: item.id,
+            name: item.name,
+            slug: item.slug || item.name,
+            score,
+          });
         }
       }
-    });
+    }
 
-    // Sort by name similarity score descending
+    // Sort matching results descending
     candidates.sort((a, b) => b.score - a.score);
 
-    // Select the best candidate (must match at least 25% of characters to prevent false positives)
+    // Get the maximum similarity (must match at least 25% to avoid unrelated false positives)
     const bestMatch = candidates.find(c => c.score >= 0.25);
 
     if (!bestMatch) {
@@ -131,85 +199,42 @@ app.get("/api/scrape-school", async (req, res) => {
       });
     }
 
-    const matchedHref = bestMatch.href;
-    const absoluteDetailUrl = matchedHref.startsWith("http")
-      ? matchedHref
-      : `https://srgaoxiao.com${matchedHref}`;
+    const absoluteDetailUrl = `https://srgaoxiao.com/school/${encodeURIComponent(bestMatch.slug)}`;
+    console.log(`Matched university "${cleanName}" -> "${bestMatch.name}" (ID: ${bestMatch.id}) at URL: ${absoluteDetailUrl}`);
 
-    console.log(`Matched university "${cleanName}" -> "${bestMatch.name}" at url: ${absoluteDetailUrl}`);
-
-    // 2. Fetch the school details page to get comments/posts/incidents
-    const detailResponse = await fetch(absoluteDetailUrl, {
+    // Fetch the school's reviews from the official API
+    const reviewsUrl = `https://srgaoxiao.com/api/reviews/school/${bestMatch.id}?sort=comprehensive&page=1&pageSize=40`;
+    console.log(`Querying reviews API at: ${reviewsUrl}`);
+    
+    const reviewsResponse = await fetch(reviewsUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept": "application/json",
       },
     });
 
-    if (!detailResponse.ok) {
-      throw new Error(`无法获取学校详情页，状态码: ${detailResponse.status}`);
+    if (!reviewsResponse.ok) {
+      throw new Error(`无法获取学校评价列表，状态码: ${reviewsResponse.status}`);
     }
 
-    const detailHtml = await detailResponse.text();
-    const $detail = cheerio.load(detailHtml);
-
+    const reviewsJson: any = await reviewsResponse.json();
+    const reviewsList = reviewsJson.data || [];
     const comments: string[] = [];
 
-    // Extract commentary texts or posts
-    // Look and extract text inside elements with classes depicting posts, content or items
-    const selectors = [
-      ".post-content", 
-      ".comment-content", 
-      ".review-content", 
-      ".incident-content",
-      "article .content",
-      ".school-review",
-      ".comment-item",
-      ".post-item .content",
-      ".card-content",
-      ".review-body",
-      ".school-comment p",
-      "p.content",
-      ".item-content",
-      "p.text-gray-700",
-      "div.text-sm.text-gray-600",
-      "div.content"
-    ];
-
-    selectors.forEach(sel => {
-      $detail(sel).each((_, el) => {
-        const text = $detail(el).text().trim();
-        // Remove noise, short words, or boilerplate buttons
+    for (const r of reviewsList) {
+      if (r.content && typeof r.content === "string") {
+        const text = r.content.replace(/\s+/g, " ").trim();
         if (text.length > 8 && !comments.includes(text)) {
-          // Additional cleanup of common noise
-          const cleanText = text
-            .replace(/\s+/g, " ")
-            .trim();
-          if (cleanText.length > 8) {
-            comments.push(cleanText);
-          }
+          comments.push(text);
         }
-      });
-    });
-
-    // If we gathered no structural comments, let's grab general paragraphs representing issues
-    if (comments.length === 0) {
-      $detail("article p, .card p, .main p").each((_, el) => {
-        const text = $detail(el).text().trim();
-        if (text.length > 15 && text.length < 800) {
-          const cleanText = text.replace(/\s+/g, " ").trim();
-          if (!comments.includes(cleanText) && !cleanText.includes("版权所有") && !cleanText.includes("京ICP")) {
-            comments.push(cleanText);
-          }
-        }
-      });
+      }
     }
 
-    // Clean comments list (remove headers/footers terms, buttons tags like 回复 赞 踩 etc.)
+    // Clean comments list (remove header/footer copyright text, empty strings, buttons keywords)
     const cleanComments = comments
       .filter(c => {
+        if (!c || typeof c !== "string") return false;
         const lower = c.toLowerCase();
-        // Skip obvious button configurations or footer copyright
         if (
           lower === "回复" || 
           lower === "分享" || 
