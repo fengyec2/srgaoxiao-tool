@@ -2,7 +2,7 @@ export interface SchoolJob {
   id: string;
   name: string; // The school name extracted from column
   rowIndex: number; // Row index in the original file
-  status: 'waiting' | 'scraping' | 'analyzing' | 'completed' | 'not_found' | 'failed';
+  status: 'waiting' | 'scraping' | 'scraped' | 'analyzing' | 'completed' | 'not_found' | 'failed';
   matchedName: string | null;
   matchedUrl: string | null;
   comments: string[];

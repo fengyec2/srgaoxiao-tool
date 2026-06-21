@@ -276,7 +276,7 @@ app.get("/api/scrape-school", async (req, res) => {
 
 // Gemini Summarize Route (Legacy/Single fallback)
 app.post("/api/ai-summarize", async (req, res) => {
-  const { schoolName, comments } = req.body;
+  const { schoolName, comments, customPrompt } = req.body;
 
   if (!schoolName) {
     return res.status(400).json({ error: "学校名称不能为空" });
@@ -288,16 +288,16 @@ app.post("/api/ai-summarize", async (req, res) => {
 
   try {
     const ai = getAiClient();
-    const prompt = `你是一个高校舆情和吐槽曝光评论的分析专家。
+    const instruction = customPrompt || `你是一个高校舆情和吐槽曝光评论的分析专家。请合并和分析这些吐槽，写出一个极其简明扼要的槽点总结。`;
+    const prompt = `${instruction}
 下面是关于【${schoolName}】这所大学被网友吐槽和评论的内容：
 ---
 ${comments.map((c, idx) => `[评论 ${idx + 1}]: ${c}`).join("\n\n")}
 ---
 
-请合并和分析这些吐槽，写出一个极其简明扼要的槽点总结。
 约束条件：
-1. 字数在 20 字以内。
-2. 语气客观中立，避开主观评价（字数决不能超出 20 个字）。
+1. 字数在 60 字以内。
+2. 语气客观中立，避开主观评价（字数决不能超出 60 个字）。
 3. 如果评论都是水贴或无意义内容，直接概括写“未见实质吐槽”。`;
 
     const response = await ai.models.generateContent({
@@ -327,7 +327,7 @@ ${comments.map((c, idx) => `[评论 ${idx + 1}]: ${c}`).join("\n\n")}
 
 // Gemini Batch Summarize Route
 app.post("/api/ai-summarize-batch", async (req, res) => {
-  const { schools } = req.body;
+  const { schools, customPrompt } = req.body;
 
   if (!schools || !Array.isArray(schools) || schools.length === 0) {
     return res.status(400).json({ error: "学校列表不能为空" });
@@ -342,16 +342,18 @@ app.post("/api/ai-summarize-batch", async (req, res) => {
       comments: (s.comments || []).slice(0, 15)
     }));
 
-    const prompt = `你是一个中国高校舆情和网友曝光评论的深度总结专家。
-现在，有 ${schools.length} 所高校的吐槽和爆料评论列表。请你分别为这几所高校，合并、分析所有的负面评论/槽点，写出一个 20 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。
+    const baseInstruction = customPrompt?.trim() || `你是一个中国高校舆情和网友曝光评论的深度总结专家。
+现在，有 ${schools.length} 所高校的吐槽和爆料评论列表。请你分别为这几所高校，合并、分析所有的负面评论/槽点，写出一个 60 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。`;
+
+    const prompt = `${baseInstruction}
 
 输出规范：
-1. 请必须返回一个合法的 JSON 对象，它的键(Key)是列表里的高校名称 (schoolName)，值(Value)是提炼的 20 字以内吐槽归纳。例如：
+1. 请必须返回一个合法的 JSON 对象，它的键(Key)是列表里的高校名称 (schoolName)，值(Value)是提炼的 60 字以内吐槽归纳。例如：
 {
-  "中国石油大学（北京）": "校区偏远大一强制晨跑自习，管理拟高中化",
-  "北京大学": "食堂拥挤，部分楼宿年代比较久远"
+  "中国石油大学（北京）": "校区偏远大一强制晨跑自习，学校管理拟高中化，且宿舍热水限制时间段供应，食堂高峰期排队较长。",
+  "北京大学": "老旧宿舍园区住宿设施稍显陈旧，高峰时段食堂就餐较为拥挤，且部分专业课程绩点给分竞争较为激烈。"
 }
-2. 约束字数在 20 个汉字以内，直切要害（如：宿舍条件差、强制早操、教务死板、周边偏僻等）。
+2. 约束字数在 60 个汉字以内，直切要害（如：宿舍条件差、强制早操、教务死板、周边偏僻等）。
 3. 语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”、“该校槽点为”等），不废话，直接给出高信息浓度的总结。
 4. 如果评论为空或全部是无意义或正面水贴，直接写“评论数据空泛或未见实质性被曝槽点”。
 

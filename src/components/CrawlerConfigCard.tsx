@@ -25,6 +25,9 @@ interface CrawlerConfigCardProps {
   setAiBatchSize: (num: number) => void;
   aiBatchInterval: number;
   setAiBatchInterval: (num: number) => void;
+  customPrompt: string;
+  setCustomPrompt: (prompt: string) => void;
+  onResetConfigs: () => void;
   isRunning: boolean;
   lowEffects: boolean;
   onResetFile: () => void;
@@ -43,6 +46,9 @@ export const CrawlerConfigCard: React.FC<CrawlerConfigCardProps> = ({
   setAiBatchSize,
   aiBatchInterval,
   setAiBatchInterval,
+  customPrompt,
+  setCustomPrompt,
+  onResetConfigs,
   isRunning,
   lowEffects,
   onResetFile,
@@ -76,14 +82,26 @@ export const CrawlerConfigCard: React.FC<CrawlerConfigCardProps> = ({
           </div>
         </div>
 
-        {/* Change file target */}
-        <button
-          id="change-file-btn"
-          onClick={onResetFile}
-          className="px-4 py-2 border border-white/10 text-xs font-medium rounded-xl text-slate-300 hover:bg-white/5 hover:text-white transition-colors"
-        >
-          重选文件
-        </button>
+        <div className="flex gap-2.5">
+          {/* Reset configuration */}
+          <button
+            id="reset-config-btn"
+            type="button"
+            onClick={onResetConfigs}
+            className="px-4 py-2 border border-white/10 text-xs font-medium rounded-xl text-slate-300 hover:bg-white/5 hover:text-white transition-colors"
+          >
+            重置系统配置
+          </button>
+
+          {/* Change file target */}
+          <button
+            id="change-file-btn"
+            onClick={onResetFile}
+            className="px-4 py-2 border border-white/10 text-xs font-medium rounded-xl text-slate-300 hover:bg-white/5 hover:text-white transition-colors"
+          >
+            重选文件
+          </button>
+        </div>
       </div>
 
       {/* Column custom matchers & config controls */}
@@ -243,6 +261,40 @@ export const CrawlerConfigCard: React.FC<CrawlerConfigCardProps> = ({
               </div>
             </div>
           </div>
+
+          {/* Custom Prompt Textarea */}
+          <div className="flex flex-col gap-2 mt-2 border-t border-white/5 pt-4">
+            <label className="text-xs font-semibold text-slate-300 flex items-center justify-between gap-1.5">
+              <span className="flex items-center gap-1.5">
+                <Sparkles className="h-4 w-4 text-blue-400" />
+                自定义 AI 总结指令 / 提示词 (Custom Summary Prompt)
+              </span>
+              <button
+                id="reset-prompt-preset-btn"
+                type="button"
+                onClick={() => setCustomPrompt('你是一个中国高校舆情和网友曝光评论的深度总结专家。请分别为下面的几所高校，根据提供的吐槽和爆料评论，写出一个 60 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”等），不废话，直接给出高信息浓度的总结。')}
+                className="text-[10px] text-blue-400 hover:text-blue-350 font-medium hover:underline transition-colors"
+              >
+                恢复默认字数与指令
+              </button>
+            </label>
+            <p className="text-[11px] text-slate-400">
+              您可以编写让大模型从特定维度总结的分析视角，系统自动维护底层 JSON 标准格式输出。
+            </p>
+            <textarea
+              id="custom-prompt-textarea"
+              value={customPrompt}
+              onChange={(e) => setCustomPrompt(e.target.value)}
+              disabled={isRunning}
+              rows={4}
+              maxLength={600}
+              placeholder="请输入自定义的大模型总结提示词指令..."
+              className="w-full text-xs font-sans bg-slate-950/60 border border-white/10 text-slate-200 rounded-xl p-3 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all resize-y min-h-[100px] leading-relaxed"
+            />
+            <div className="text-[10px] text-slate-500 text-right">
+              {customPrompt.length}/600 字 (默认提示词已更新约束大模型生成不超过 60 字的高含金量总结)
+            </div>
+          </div>
         </div>
       )}
 
@@ -251,7 +303,7 @@ export const CrawlerConfigCard: React.FC<CrawlerConfigCardProps> = ({
         <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-start gap-2.5">
           <Sparkles className="h-4 w-4 text-blue-400 shrink-0 mt-0.5" />
           <div className="text-xs text-slate-300 leading-relaxed">
-            <strong>AI 模式精讲：</strong>采集神人高校网上对应的高校负面舆情评论后，服务器会自动调用 <strong>Gemini 3.5 Flash</strong> 大语言模型智能分析各暴露槽点，并全自动压缩为您一键可见的「极简备注评价（20字以内）」。此过程需要保持网络稳定。
+            <strong>AI 模式精讲：</strong>采集神人高校网上对应的高校负面舆情评论后，服务器会自动调用 <strong>Gemini 3.5 Flash</strong> 大语言模型智能分析各暴露槽点，并全自动压缩为您一键可见的「极简备注评价（60字以内）」。此过程需要保持网络稳定。
           </div>
         </div>
       )}

@@ -66,7 +66,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-slate-200 font-medium rounded-xl text-xs border border-white/10 transition-colors disabled:opacity-40"
         >
           <RotateCcw className="h-3.5 w-3.5" />
-          重置所有人设
+          重置检索进度
         </button>
       </div>
 

@@ -17,18 +17,76 @@ import { ControlPanel } from './components/ControlPanel';
 import { StatsDashboard } from './components/StatsDashboard';
 import { ExportCard } from './components/ExportCard';
 import { JobListTable } from './components/JobListTable';
+import { CustomDialog } from './components/CustomDialog';
 
 export default function App() {
-  // File state
-  const [fileData, setFileData] = useState<FileData | null>(null);
-  const [selectedColIndex, setSelectedColIndex] = useState<number>(-1);
+  // File state (restored from browser storage)
+  const [fileData, setFileData] = useState<FileData | null>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_file_data');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [selectedColIndex, setSelectedColIndex] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_selected_col_index');
+      return saved ? Number(saved) : -1;
+    } catch {
+      return -1;
+    }
+  });
+
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
 
-  // Crawler config
-  const [mode, setMode] = useState<ProcessingMode>('local');
-  const [concurrency, setConcurrency] = useState<number>(3); // "Threads" counts
-  const [aiBatchSize, setAiBatchSize] = useState<number>(15);
-  const [aiBatchInterval, setAiBatchInterval] = useState<number>(1.5);
+  // Crawler config (restored from browser storage)
+  const [mode, setMode] = useState<ProcessingMode>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_mode');
+      return (saved as ProcessingMode) || 'local';
+    } catch {
+      return 'local';
+    }
+  });
+
+  const [concurrency, setConcurrency] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_concurrency');
+      return saved ? Number(saved) : 3;
+    } catch {
+      return 3;
+    }
+  });
+
+  const [aiBatchSize, setAiBatchSize] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_ai_batch_size');
+      return saved ? Number(saved) : 15;
+    } catch {
+      return 15;
+    }
+  });
+
+  const [aiBatchInterval, setAiBatchInterval] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_ai_batch_interval');
+      return saved ? Number(saved) : 10; // Default set to 10s as requested
+    } catch {
+      return 10;
+    }
+  });
+
+  const [customPrompt, setCustomPrompt] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_custom_prompt');
+      return saved || '你是一个中国高校舆情和网友曝光评论的深度总结专家。请分别为下面的几所高校，根据提供的吐槽和爆料评论，写出一个 60 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”等），不废话，直接给出高信息浓度的总结。';
+    } catch {
+      return '你是一个中国高校舆情和网友曝光评论的深度总结专家。请分别为下面的几所高校，根据提供的吐槽和爆料评论，写出一个 60 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”等），不废话，直接给出高信息浓度的总结。';
+    }
+  });
+
   const [lowEffects, setLowEffects] = useState<boolean>(() => {
     try {
       return localStorage.getItem('low_effects_mode') === 'true';
@@ -47,12 +105,73 @@ export default function App() {
     }
   };
 
+  // Dialog (alert/confirm) state matching page level double verification
+  const [dialog, setDialog] = useState<{
+    isOpen: boolean;
+    type: 'confirm' | 'alert';
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    cancelText?: string;
+    confirmText?: string;
+  }>({
+    isOpen: false,
+    type: 'alert',
+    title: '',
+    message: '',
+    onConfirm: () => {},
+  });
+
+  const showAlert = (title: string, message: string, onConfirm: () => void = () => {}) => {
+    setDialog({
+      isOpen: true,
+      type: 'alert',
+      title,
+      message,
+      onConfirm: () => {
+        setDialog(prev => ({ ...prev, isOpen: false }));
+        onConfirm();
+      },
+      confirmText: '我知道了',
+    });
+  };
+
+  const showConfirm = (title: string, message: string, onConfirm: () => void, confirmText?: string) => {
+    setDialog({
+      isOpen: true,
+      type: 'confirm',
+      title,
+      message,
+      onConfirm: () => {
+        setDialog(prev => ({ ...prev, isOpen: false }));
+        onConfirm();
+      },
+      cancelText: '取消',
+      confirmText: confirmText || '确认',
+    });
+  };
+
   // Crawler processing state
-  const [jobs, setJobs] = useState<SchoolJob[]>([]);
+  const [jobs, setJobs] = useState<SchoolJob[]>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_jobs');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
   const [isRunning, setIsRunning] = useState<boolean>(false);
 
   // Time & Speed counters
-  const [elapsedTime, setElapsedTime] = useState<number>(0);
+  const [elapsedTime, setElapsedTime] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('crawler_elapsed_time');
+      return saved ? Number(saved) : 0;
+    } catch {
+      return 0;
+    }
+  });
   const [estRemaining, setEstRemaining] = useState<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -67,6 +186,7 @@ export default function App() {
   const modeRef = useRef<ProcessingMode>(mode);
   const aiBatchSizeRef = useRef<number>(aiBatchSize);
   const aiBatchIntervalRef = useRef<number>(aiBatchInterval);
+  const customPromptRef = useRef<string>(customPrompt);
 
   // Keep references in sync with state to avoid stale closure under async workers
   useEffect(() => {
@@ -75,23 +195,89 @@ export default function App() {
 
   useEffect(() => {
     jobsRef.current = jobs;
+    try {
+      if (jobs && jobs.length > 0) {
+        localStorage.setItem('crawler_jobs', JSON.stringify(jobs));
+      } else {
+        localStorage.removeItem('crawler_jobs');
+      }
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
   }, [jobs]);
 
   useEffect(() => {
     concurrencyRef.current = concurrency;
+    try {
+      localStorage.setItem('crawler_concurrency', String(concurrency));
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
   }, [concurrency]);
 
   useEffect(() => {
     modeRef.current = mode;
+    try {
+      localStorage.setItem('crawler_mode', mode);
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
   }, [mode]);
 
   useEffect(() => {
     aiBatchSizeRef.current = aiBatchSize;
+    try {
+      localStorage.setItem('crawler_ai_batch_size', String(aiBatchSize));
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
   }, [aiBatchSize]);
 
   useEffect(() => {
     aiBatchIntervalRef.current = aiBatchInterval;
+    try {
+      localStorage.setItem('crawler_ai_batch_interval', String(aiBatchInterval));
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
   }, [aiBatchInterval]);
+
+  useEffect(() => {
+    customPromptRef.current = customPrompt;
+    try {
+      localStorage.setItem('crawler_custom_prompt', customPrompt);
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
+  }, [customPrompt]);
+
+  useEffect(() => {
+    try {
+      if (fileData) {
+        localStorage.setItem('crawler_file_data', JSON.stringify(fileData));
+      } else {
+        localStorage.removeItem('crawler_file_data');
+      }
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
+  }, [fileData]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('crawler_selected_col_index', String(selectedColIndex));
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
+  }, [selectedColIndex]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('crawler_elapsed_time', String(elapsedTime));
+    } catch (err) {
+      console.warn('LocalStorage save error:', err);
+    }
+  }, [elapsedTime]);
 
   // Synchronous timer trigger
   useEffect(() => {
@@ -149,7 +335,7 @@ export default function App() {
         // Parse raw rows (including header)
         const rawRows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1 });
         if (rawRows.length === 0) {
-          alert('表格为空或格式不正确！');
+          showAlert('文件解析提示', '您上传的表格为空或格式不正确！');
           return;
         }
 
@@ -181,7 +367,7 @@ export default function App() {
 
       } catch (err: any) {
         console.error(err);
-        alert(`解析文件失败: ${err.message || err}`);
+        showAlert('解析失败', `解析高校名单表格文件时发生错误: ${err.message || err}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -247,7 +433,7 @@ export default function App() {
       if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
         handleFile(file);
       } else {
-        alert('仅支持上传 .xlsx, .xls 或 .csv 文件！');
+        showAlert('格式不支持', '您上传的文件格式不正确，本系统仅支持上传 .xlsx, .xls 或 .csv 类型的手动或推荐表格文件！');
       }
     }
   };
@@ -302,7 +488,8 @@ export default function App() {
               id: b.id,
               name: b.name,
               comments: b.comments
-            }))
+            })),
+            customPrompt: customPromptRef.current
           })
         });
 
@@ -483,16 +670,47 @@ export default function App() {
     setIsRunning(false);
   };
 
+  // Reset entire system configurations with in-page custom double verification
+  const resetConfigs = () => {
+    showConfirm(
+      '重置所有设置确认',
+      '您确定要重置当前所有的配置参数吗？这包含：并发线程数、单次打包群数、组响应间隔延迟，并清空还原您的智能总结指令提示词。',
+      () => {
+        setConcurrency(3);
+        setMode('local');
+        setAiBatchSize(15);
+        setAiBatchInterval(10);
+        setCustomPrompt('你是一个中国高校舆情和网友曝光评论的深度总结专家。请分别为下面的几所高校，根据提供的吐槽和爆料评论，写出一个 60 字以内高水平、客观简明的吐槽一句话总结（千万不要编造内容，仅对提供的讨论事实进行中立归纳）。语气中立客观，不要带有前缀（例如“总结：”、“根据评论：”等），不废话，直接给出高信息浓度的总结。');
+        
+        try {
+          localStorage.removeItem('crawler_concurrency');
+          localStorage.removeItem('crawler_mode');
+          localStorage.removeItem('crawler_ai_batch_size');
+          localStorage.removeItem('crawler_ai_batch_interval');
+          localStorage.removeItem('crawler_custom_prompt');
+        } catch {}
+        
+        showAlert('重置成功', '所有的系统配置（批量数15，安全间隔10秒，重置大模型总结角色等）已恢复为最优推荐默认参数值并已写入缓存。');
+      },
+      '确定重置'
+    );
+  };
+
   // Reset/Clear controller
   const resetProcessing = () => {
-    if (window.confirm('您确定要重置当前所有的检索进度和状态吗？')) {
-      setIsRunning(false);
-      setElapsedTime(0);
-      setEstRemaining(null);
-      if (fileData) {
-        initializeJobs(fileData.rows, selectedColIndex);
-      }
-    }
+    showConfirm(
+      '重置舆情检索确认',
+      '您确定要重置当前所有的检索进度和状态吗？重置后将清除已有的爬取详情与舆情曝光评论，需要重新对名单进行排查。',
+      () => {
+        setIsRunning(false);
+        setElapsedTime(0);
+        setEstRemaining(null);
+        if (fileData) {
+          initializeJobs(fileData.rows, selectedColIndex);
+        }
+      },
+      '确定重置'
+    );
   };
 
   // Quick stats computed on-the-fly
@@ -582,7 +800,7 @@ export default function App() {
 
     } catch (err: any) {
       console.error(err);
-      alert(`导出文件发生错误: ${err.message || err}`);
+      showAlert('导出失败', `导出分析结果到 Excel 时发生错误: ${err.message || err}`);
     }
   };
 
@@ -628,11 +846,20 @@ export default function App() {
               setAiBatchSize={setAiBatchSize}
               aiBatchInterval={aiBatchInterval}
               setAiBatchInterval={setAiBatchInterval}
+              customPrompt={customPrompt}
+              setCustomPrompt={setCustomPrompt}
+              onResetConfigs={resetConfigs}
               isRunning={isRunning}
               lowEffects={lowEffects}
               onResetFile={() => {
                 setFileData(null);
                 setJobs([]);
+                try {
+                  localStorage.removeItem('crawler_file_data');
+                  localStorage.removeItem('crawler_jobs');
+                  localStorage.removeItem('crawler_selected_col_index');
+                  localStorage.removeItem('crawler_elapsed_time');
+                } catch {}
               }}
             />
           )}
@@ -690,6 +917,18 @@ export default function App() {
 
       {/* Footer */}
       <Footer />
+
+      {/* Custom dialog for alert and confirm validations */}
+      <CustomDialog
+        isOpen={dialog.isOpen}
+        type={dialog.type}
+        title={dialog.title}
+        message={dialog.message}
+        onConfirm={dialog.onConfirm}
+        onCancel={() => setDialog(prev => ({ ...prev, isOpen: false }))}
+        confirmText={dialog.confirmText}
+        cancelText={dialog.cancelText}
+      />
 
     </div>
   );
